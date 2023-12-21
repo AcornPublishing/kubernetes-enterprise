@@ -1,0 +1,401 @@
+---
+apiVersion: openunison.tremolo.io/v1
+kind: Workflow
+metadata:
+  name: create-operations-production
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app.kubernetes.io/name: openunison
+    app.kubernetes.io/instance: openunison-{{ .Release.Name }}
+    app.kubernetes.io/component: openunison-workflows
+    app.kubernetes.io/part-of: openunison
+spec:
+  description: Create production operations application in argocd
+  inList: false
+  label: Create Production Operations Application
+  orgId: 9d251de8-e481-45da-b22c-c8c98952e581
+  dynamicConfiguration:
+    dynamic: false
+    className: ""
+    params: []
+  tasks: |-
+    
+    # create an operations project in gitlab
+    - taskType: customTask
+      className: com.tremolosecurity.unison.gitlab.provisioning.tasks.CreateProject
+      params:
+        namespace: $nameSpace$-production
+        name: $nameSpace$-operations
+        description: Operations project
+        issuesEnabled: "true"
+        mergeRequestsEnabled: "true"
+        wikiEnabled: "true"
+        snipitsEnabled: "true"
+        visibility: "2"
+        targetName: gitlab
+        gitSshHost: {{ .Values.openunison.non_secret_data.GITLAB_SSH_HOST | quote }}
+        createWebhook: "false"
+        webhookSuffix: {{ .Values.openunison.non_secret_data.GITLAB_WEBHOOK_SUFFIX | quote }}
+        webhookBranchFilter: "main"
+    
+    # create a git file so there's something in the repo
+    - taskType: customTask
+      className: com.tremolosecurity.unison.gitlab.provisioning.tasks.CreateGitFile
+      params:
+        targetName: gitlab
+        namespace: $nameSpace$-production
+        project: $nameSpace$-operations
+        branch: main
+        path: README.md
+        content: |-
+          # $nameSpace$-build 
+
+          Fork this project to create manifests for $nameSpace$.  Create a pull request to deploy updates.
+        commitMessage: initializing the repository
+
+    # create a git repo in argocd that is connected to our operations project in gitlab
+    - taskType: customTask
+      className: com.tremolosecurity.argocd.tasks.CreateGitRepository
+      params:
+        type: git
+        name: $nameSpace$-operations
+        repoUrl: "$gitSshInternalURL$"
+        sshPrivateKey: $gitPrivateKey$
+        target: argocd
+
+    # approvers need to be able to approve pull requests
+    - taskType: customTask
+      className: com.tremolosecurity.unison.gitlab.provisioning.tasks.AddGroupToProject
+      params:
+        groupName: approvers-k8s-$nameSpace$
+        targetName: gitlab
+        accessLevel: MAINTAINER
+
+    # operations need to be able to fork for development
+    - taskType: customTask
+      className: com.tremolosecurity.unison.gitlab.provisioning.tasks.AddGroupToProject
+      params:
+        groupName: k8s-namespace-operations-$nameSpace$
+        targetName: gitlab
+        accessLevel: DEVELOPER
+
+    # developers need to be able to fork for development
+    - taskType: customTask
+      className: com.tremolosecurity.unison.gitlab.provisioning.tasks.AddGroupToProject
+      params:
+        groupName: k8s-namespace-developer-$nameSpace$
+        targetName: gitlab
+        accessLevel: DEVELOPER
+
+    
+    # create the production namespace
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: Namespace
+        url: /api/v1/namespaces
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/namespaces/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod.yaml
+        template: |-
+          kind: Namespace
+          apiVersion: v1
+          metadata:
+            name: $nameSpace$-prod
+            labels:
+              name: $nameSpace$-prod
+              application: $nameSpace$
+              type: application
+              env: prod
+
+    # create rolebinding for admins
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: RoleBinding
+        url: /apis/rbac.authorization.k8s.io/v1/namespaces/$nameSpace$-prod/rolebindings
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/namespaces/$nameSpace$/$nameSpace$-prod/rolebindings/operations-binding.yaml
+        template: |-
+          kind: RoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: operations-binding
+            namespace: $nameSpace$-prod
+          subjects:
+            - kind: Group
+              name: k8s-namespace-operations-$nameSpace$
+              apiGroup: rbac.authorization.k8s.io
+          roleRef:
+            kind: ClusterRole
+            name: admin
+            apiGroup: rbac.authorization.k8s.io
+
+    # create rolebinding for developers
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: RoleBinding
+        url: /apis/rbac.authorization.k8s.io/v1/namespaces/$nameSpace$-prod/rolebindings
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/namespaces/$nameSpace$/$nameSpace$-prod/rolebindings/developers-binding.yaml
+        template: |-
+          kind: RoleBinding
+          apiVersion: rbac.authorization.k8s.io/v1
+          metadata:
+            name: developers-binding
+            namespace: $nameSpace$-prod
+          subjects:
+            - kind: Group
+              name: k8s-namespace-developer-$nameSpace$
+              apiGroup: rbac.authorization.k8s.io
+          roleRef:
+            kind: ClusterRole
+            name: view
+            apiGroup: rbac.authorization.k8s.io
+    
+    # create gatekeeper policies
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPAllowPrivilegeEscalationContainer
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spspallowprivilegeescalationcontainer
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-privilege-escalation-deny-all.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPAllowPrivilegeEscalationContainer
+          metadata:
+            name: $nameSpace$-prod-privilege-escalation-deny-all
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPCapabilities
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spspcapabilities
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-capabilities-drop-all.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPCapabilities
+          metadata:
+            name: $nameSpace$-prod-capabilities-drop-all
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+            parameters:
+              requiredDropCapabilities: ["all"]
+              allowedCapabilities: []
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPForbiddenSysctls
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spspforbiddensysctls
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-forbid-all-sysctls.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPForbiddenSysctls
+          metadata:
+            name: $nameSpace$-prod-psp-forbid-all-sysctls
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+            parameters:
+              forbiddenSysctls:
+              - "*"
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPHostFilesystem
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spsphostfilesystem
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-deny-host-filesystem.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPHostFilesystem
+          metadata:
+            name: $nameSpace$-prod-psp-deny-host-filesystem
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+            parameters:
+              allowedHostPaths: []
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPHostNamespace
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spsphostnamespace
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-bloack-all-host-namespace.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPHostNamespace
+          metadata:
+            name: $nameSpace$-prod-psp-bloack-all-host-namespace
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPHostNetworkingPorts
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spsphostnetworkingports
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-deny-all-host-network-ports.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPHostNetworkingPorts
+          metadata:
+            name: $nameSpace$-prod-psp-deny-all-host-network-ports
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+            parameters:
+              hostNetwork: false
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPPrivilegedContainer
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spspprivilegedcontainer
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-deny-all-privileged-container.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPPrivilegedContainer
+          metadata:
+            name: $nameSpace$-prod-psp-deny-all-privileged-container
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPProcMount
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spspprocmount
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-proc-mount-default.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPProcMount
+          metadata:
+            name: $nameSpace$-prod-psp-proc-mount-default
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+            parameters:
+              procMount: Default
+
+    - taskType: customTask
+      className: com.tremolosecurity.provisioning.tasks.CreateK8sObject
+      params:
+        targetName: k8s
+        kind: K8sPSPAllowedUsers
+        url: /apis/constraints.gatekeeper.sh/v1beta1/k8spspallowedusers
+        srcType: yaml
+        writeToRequest: "true"
+        requestAttribute: state-application-$nameSpace$
+        path: /src/cluster/gatekeeper/$nameSpace$/$nameSpace$-prod/$nameSpace$-prod-psp-pods-allowed-user-ranges.yaml
+        template: |-
+          apiVersion: constraints.gatekeeper.sh/v1beta1
+          kind: K8sPSPAllowedUsers
+          metadata:
+            name: $nameSpace$-prod-psp-pods-allowed-user-ranges
+          spec:
+            match:
+              kinds:
+                - apiGroups: [""]
+                  kinds: ["Pod"]
+              namespaces: ["$nameSpace$-prod"]
+            parameters:
+              runAsUser:
+                rule: MustRunAs # MustRunAsNonRoot # RunAsAny 
+                ranges:
+                  - min: 100
+                    max: 4294967294
+              runAsGroup:
+                rule: MustRunAs # MayRunAs # RunAsAny 
+                ranges:
+                  - min: 100
+                    max: 4294967294
+              supplementalGroups:
+                rule: MustRunAs # MayRunAs # RunAsAny 
+                ranges:
+                  - min: 100
+                    max: 4294967294
+              fsGroup:
+                rule: MustRunAs # MayRunAs # RunAsAny 
+                ranges:
+                  - min: 100
+                    max: 4294967294
+
+    
+            
+  
+
+    
